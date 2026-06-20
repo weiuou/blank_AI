@@ -6,7 +6,7 @@ An AI-driven blank canvas experience that starts as a pure white page with one c
 
 - React 19 + Vite + TypeScript
 - Node + Express + TypeScript
-- OpenAI-compatible Responses API through a configurable server-side proxy
+- Native fetch-based model providers for text and image generation
 - Vitest + Testing Library + Supertest
 
 ## Run locally
@@ -23,19 +23,22 @@ This starts:
 
 ## Environment
 
-Create a `.env` file if you want real model responses:
+Model selection lives in `.env.example`:
 
 ```bash
-OPENAI_API_KEY=your_key_here
-OPENAI_BASE_URL=https://cpa.weiuou.art/v1
-OPENAI_MODEL=gpt-5
-OPENAI_IMAGE_MODEL=gpt-image-2
-OPENAI_IMAGE_SIZE=1536x1024
-OPENAI_IMAGE_QUALITY=medium
-PORT=8787
+LANGUAGE_MODEL=MiniMax-M3
+IMAGE_MODEL=gemini-3.1-flash-image
 ```
 
-`OPENAI_API_KEY` is required for local AI calls. Tests still use a deterministic local patch path so they do not need your key.
+Keep private endpoints and keys in `.env.local`, which is ignored by git:
+
+```bash
+MINIMAX_API_KEY=...
+GEMINI_IMAGE_BASE_URL=https://your-private-gemini-site/v1beta
+GEMINI_IMAGE_API_KEY=...
+```
+
+The model config is just `LANGUAGE_MODEL` and `IMAGE_MODEL`; provider implementations resolve endpoints, authentication, request paths, and response parsing. `MiniMax-M3` posts to the MiniMax `/responses` endpoint, and `gemini-3.1-flash-image` posts to Gemini native `models/{model}:generateContent`.
 
 ## Scripts
 
@@ -49,7 +52,7 @@ npm run test
 
 - Initial screen is a white stage with one centered prompt
 - After the first prompt, the background is rendered from a controlled component tree
-- Strong visual background prompts call `gpt-image-2` and render the generated image behind the prompt
+- Strong visual background prompts call `gemini-3.1-flash-image` and render the generated image behind the prompt
 - The prompt stays centered while AI changes the page behind it
 - `Ctrl+Z` / `Cmd+Z` undoes the last AI interaction
 - The server validates patch operations before the client applies them

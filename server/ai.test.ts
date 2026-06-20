@@ -3,40 +3,73 @@ import { createInitialPageState } from '../src/shared/defaults';
 import type { PageState } from '../src/shared/types';
 
 const responsesCreateMock = vi.fn();
-
-vi.mock('openai', () => {
-  class MockOpenAI {
-    responses = {
-      create: responsesCreateMock,
-    };
-  }
-
-  return {
-    default: MockOpenAI,
-  };
-});
+const imageFetchMock = vi.fn();
 
 describe('generateAssistantResponse image continuity', () => {
-  const originalFetch = global.fetch;
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/responses')) {
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      const result = await responsesCreateMock(body, input, init);
+      if (result instanceof Response) {
+        return result;
+      }
+      return new Response(JSON.stringify(result), { status: 200 });
+    }
+
+    if (url.includes(':generateContent')) {
+      return imageFetchMock(input, init);
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  });
 
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
-    process.env.OPENAI_API_KEY = 'test-key';
-    process.env.OPENAI_BASE_URL = 'https://cpa.weiuou.art/v1';
-    process.env.OPENAI_IMAGE_MODEL = 'gpt-image-2';
-    process.env.OPENAI_IMAGE_SIZE = '1536x1024';
+    responsesCreateMock.mockReset();
+    imageFetchMock.mockReset();
+    process.env.MINIMAX_API_KEY = 'test-minimax-key';
+    process.env.MINIMAX_BASE_URL = 'https://api.minimaxi.test/v1';
+    process.env.GEMINI_IMAGE_API_KEY = 'test-gemini-key';
+    process.env.GEMINI_IMAGE_BASE_URL = 'https://gemini.local/v1beta';
+    process.env.LANGUAGE_MODEL = 'MiniMax-M3';
+    process.env.IMAGE_MODEL = 'gemini-3.1-flash-image';
     process.env.USE_AI_MOCK = 'false';
-    global.fetch = originalFetch;
+    vi.stubGlobal('fetch', fetchMock);
   });
 
-  function mockImageFetch(base64 = Buffer.from('generated image').toString('base64')) {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
-      return new Response(JSON.stringify({ data: [{ b64_json: base64 }] }), { status: 200 });
+  function mockImageFetch(base64 = Buffer.from('generated image').toString('base64'), casing: 'snake' | 'camel' = 'snake') {
+    imageFetchMock.mockImplementation(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      const inlinePart =
+        casing === 'camel'
+          ? {
+              inlineData: {
+                mimeType: 'image/webp',
+                data: base64,
+              },
+            }
+          : {
+              inline_data: {
+                mime_type: 'image/png',
+                data: base64,
+              },
+            };
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [inlinePart],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
     });
-    vi.stubGlobal('fetch', fetchMock);
-    return fetchMock;
+    return imageFetchMock;
   }
 
   it('edits an existing image background instead of adding a replacement', async () => {
@@ -86,12 +119,18 @@ describe('generateAssistantResponse image continuity', () => {
     const response = await generateAssistantResponse('在中间加一个minecraft图标', pageState, []);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://cpa.weiuou.art/v1/images/edits');
-    const editBody = fetchMock.mock.calls[0]?.[1]?.body;
-    expect(editBody).toBeInstanceOf(FormData);
-    expect((editBody as FormData).get('model')).toBe('gpt-image-2');
-    expect((editBody as FormData).get('background')).toBe('opaque');
-    expect((editBody as FormData).get('output_format')).toBe('png');
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://gemini.local/v1beta/models/gemini-3.1-flash-image:generateContent');
+    const editBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const editParts = editBody.contents[0].parts;
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'Content-Type': 'application/json',
+      'x-goog-api-key': 'test-gemini-key',
+    });
+    expect(editParts[0].inline_data).toMatchObject({
+      mime_type: 'image/png',
+      data: Buffer.from('original background').toString('base64'),
+    });
+    expect(editParts[1].text).toContain('minecraft');
     expect(response.patch).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -148,12 +187,9 @@ describe('generateAssistantResponse image continuity', () => {
     const response = await generateAssistantResponse('修改表格的背景，希望生成一个图作为表格背景', pageState, []);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://cpa.weiuou.art/v1/images/generations');
-    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
-      model: 'gpt-image-2',
-      size: '1536x1024',
-      output_format: 'png',
-    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://gemini.local/v1beta/models/gemini-3.1-flash-image:generateContent');
+    const generationBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(generationBody.contents[0].parts[0].text).toContain('Subtle abstract texture');
     expect(response.patch).toHaveLength(1);
     expect(response.patch[0]).toMatchObject({
       type: 'update_node',
@@ -166,6 +202,56 @@ describe('generateAssistantResponse image continuity', () => {
       }),
     );
     expect(JSON.stringify(response.patch)).not.toContain('image_background');
+  });
+
+  it('uses IMAGE_MODEL through the Gemini native image provider', async () => {
+    process.env.IMAGE_MODEL = 'gemini-3.1-flash-image';
+    responsesCreateMock
+      .mockResolvedValueOnce({
+        output_text: JSON.stringify({
+          reasoning: 'The user wants a generated image as the table background.',
+          target: 'component',
+          targetNodeId: 'table-1',
+          needsImage: true,
+          imagePrompt: 'Subtle abstract texture for a table background',
+          shouldEditExistingImage: false,
+          shouldRewriteComponentCode: true,
+        }),
+      })
+      .mockRejectedValueOnce(new Error('finalizer unavailable'));
+    const imageBase64 = Buffer.from('self hosted table background').toString('base64');
+    const fetchMock = mockImageFetch(imageBase64, 'camel');
+
+    const { generateAssistantResponse } = await import('./ai');
+    const pageState: PageState = createInitialPageState();
+    pageState.root.children.unshift({
+      id: 'table-1',
+      type: 'generated_react_component',
+      props: {
+        name: 'SimpleTable',
+        code: "return React.createElement('table', null)",
+        mountProps: {
+          title: 'Data table',
+          columns: ['Name', 'Team'],
+          rows: [['Ada', 'Product']],
+        },
+        capabilities: [],
+      },
+      styleTokens: {
+        width: '100%',
+        minHeight: '320px',
+      },
+      children: [],
+    });
+
+    const response = await generateAssistantResponse('Use an image as the table background', pageState, []);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://gemini.local/v1beta/models/gemini-3.1-flash-image:generateContent');
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      contents: [{ role: 'user', parts: [expect.objectContaining({ text: expect.stringContaining('Subtle abstract texture') })] }],
+    });
+    expect(JSON.stringify(response.patch)).toContain(`data:image/webp;base64,${imageBase64}`);
   });
 
   it('does not send generated image base64 into the final text model request', async () => {
@@ -669,7 +755,7 @@ describe('generateAssistantResponse image continuity', () => {
         shouldRewriteComponentCode: true,
       }),
     });
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 502 })));
+    imageFetchMock.mockResolvedValueOnce(new Response('', { status: 502 }));
 
     const { generateAssistantResponse } = await import('./ai');
     const pageState: PageState = createInitialPageState();

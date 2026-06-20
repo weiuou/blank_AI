@@ -1,4 +1,3 @@
-import OpenAI from 'openai';
 import { z } from 'zod';
 import { defaultTheme } from '../src/shared/defaults';
 import { applyPatchOperations, summarizePageState, validatePatchOperations } from '../src/shared/patches';
@@ -47,6 +46,32 @@ type WorkflowTraceStep =
   | { type: 'final_patch'; summary: string; patchCount: number };
 
 type ImageRefMap = Map<string, string>;
+type StructuredResponseInput = Array<{
+  role: 'system' | 'user';
+  content: Array<{
+    type: 'input_text';
+    text: string;
+  }>;
+}>;
+type StructuredJsonArgs<T> = {
+  input: StructuredResponseInput;
+  format: StructuredResponseFormat;
+  parser: z.ZodType<T>;
+  workflowId?: string;
+  source: string;
+};
+type TextModelClient = {
+  baseUrl: string;
+  model: string;
+  provider: string;
+  createStructuredJson: <T>(args: StructuredJsonArgs<T>) => Promise<T>;
+};
+type ImageModelClient = {
+  provider: string;
+  model: string;
+  generateBackground: (prompt: string) => Promise<string>;
+  editBackground: (prompt: string, currentImageDataUrl: string) => Promise<string>;
+};
 
 const modelResponseSchema = {
   type: 'json_schema',
@@ -92,12 +117,12 @@ const workflowPlanResponseSchema = {
   },
 } as const;
 
-let openaiClient: OpenAI | null = null;
+type StructuredResponseFormat = typeof modelResponseSchema | typeof workflowPlanResponseSchema;
 
-const defaultBaseUrl = 'https://cpa.weiuou.art';
-const defaultModel = 'gpt-5';
-const defaultImageModel = 'gpt-image-2';
-const defaultImageSize = '1024x768';
+const defaultMiniMaxBaseUrl = 'https://api.minimaxi.com/v1';
+const defaultGeminiImageBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+const defaultModel = 'MiniMax-M3';
+const defaultImageModel = 'gemini-3.1-flash-image';
 const defaultTextTimeoutMs = 70_000;
 const defaultImageTimeoutMs = 120_000;
 const defaultPatchRepairAttempts = 2;
@@ -118,8 +143,17 @@ const patchProtocolPrompt = [
 ].join('\n');
 
 function normalizeBaseUrl(baseUrl: string): string {
-  const trimmed = baseUrl.replace(/\/+$/, '');
-  return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+  const trimmed = stripTrailingSlash(baseUrl);
+  return trimmed.endsWith('/v1') || trimmed.endsWith('/v1beta') ? trimmed : `${trimmed}/v1`;
+}
+
+function normalizeGeminiBaseUrl(baseUrl: string): string {
+  const trimmed = stripTrailingSlash(baseUrl);
+  return /\/v\d+(?:beta)?$/i.test(trimmed) ? trimmed : `${trimmed}/v1beta`;
+}
+
+function stripTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, '');
 }
 
 function shouldLogAiHttp(): boolean {
@@ -200,51 +234,31 @@ function createLoggedFetch(): typeof fetch {
   };
 }
 
-function getClient(): OpenAI {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    if (process.env.NODE_ENV === 'test' || process.env.USE_AI_MOCK === 'true') {
-      throw new Error('AI_MOCK_ENABLED');
-    }
-    throw new Error('Missing OPENAI_API_KEY. Add it to .env before calling the AI endpoint.');
-  }
-  openaiClient ??= new OpenAI({
-    apiKey,
-    baseURL: normalizeBaseUrl(process.env.OPENAI_BASE_URL ?? defaultBaseUrl),
-    fetch: shouldLogAiHttp() ? createLoggedFetch() : undefined,
-    maxRetries: 0,
-    timeout: Number(process.env.OPENAI_TEXT_TIMEOUT_MS ?? defaultTextTimeoutMs),
-  });
-  return openaiClient;
+function getOptionalProviderApiKey(envNames: string[]): string | undefined {
+  return envNames.map((name) => process.env[name]).find((value): value is string => typeof value === 'string' && value.length > 0);
 }
 
-function getRequiredApiKey(): string {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    if (process.env.NODE_ENV === 'test' || process.env.USE_AI_MOCK === 'true') {
-      throw new Error('AI_MOCK_ENABLED');
-    }
-    throw new Error('Missing OPENAI_API_KEY. Add it to .env before calling the AI endpoint.');
-  }
-  return apiKey;
+function getTextModel(): string {
+  return process.env.LANGUAGE_MODEL ?? defaultModel;
 }
 
-function getOpenAiBaseUrl(): string {
-  return normalizeBaseUrl(process.env.OPENAI_BASE_URL ?? defaultBaseUrl);
+function getImageModel(): string {
+  return process.env.IMAGE_MODEL ?? defaultImageModel;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, label = 'AI request'): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const requestFetch = shouldLogAiHttp() ? createLoggedFetch() : fetch;
 
   try {
-    return await fetch(url, {
+    return await requestFetch(url, {
       ...init,
       signal: controller.signal,
     });
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`Image request timed out after ${timeoutMs}ms`);
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
     }
     throw error;
   } finally {
@@ -252,26 +266,50 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-async function parseImageResponse(response: Response): Promise<string> {
-  const responseText = await response.text();
-  if (!response.ok) {
-    throw new Error(formatImageEndpointError(response.status, responseText));
+function parseImageDataUrl(dataUrl: string): { base64: string; mimeType: string } {
+  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,(.+)$/);
+  if (!match) {
+    throw new Error('Existing image background is not an editable data URL.');
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(responseText);
-  } catch {
-    throw new Error('Image endpoint returned non-JSON response.');
+  return {
+    base64: match[2],
+    mimeType: match[1] === 'image/jpg' ? 'image/jpeg' : match[1],
+  };
+}
+
+function extractInlineImageDataUrl(parsed: unknown): string {
+  const candidates = (parsed as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) {
+    throw new Error('Image model did not return candidates.');
   }
 
-  const data = (parsed as { data?: Array<{ b64_json?: unknown; url?: unknown }> }).data;
-  const base64 = data?.[0]?.b64_json;
-  if (typeof base64 === 'string' && base64.length > 0) {
-    return `data:image/png;base64,${base64}`;
+  for (const candidate of candidates) {
+    const parts = (candidate as { content?: { parts?: unknown } }).content?.parts;
+    if (!Array.isArray(parts)) {
+      continue;
+    }
+
+    for (const part of parts) {
+      const typedPart = part as {
+        inlineData?: { data?: unknown; mimeType?: unknown };
+        inline_data?: { data?: unknown; mime_type?: unknown };
+      };
+      const inlineData = typedPart.inlineData ?? typedPart.inline_data;
+      const data = inlineData?.data;
+      if (typeof data === 'string' && data.length > 0) {
+        const mimeType =
+          typeof typedPart.inlineData?.mimeType === 'string'
+            ? typedPart.inlineData.mimeType
+            : typeof typedPart.inline_data?.mime_type === 'string'
+              ? typedPart.inline_data.mime_type
+              : 'image/png';
+        return `data:${mimeType};base64,${data}`;
+      }
+    }
   }
 
-  throw new Error('Image model did not return base64 image data.');
+  throw new Error('Image model did not return inline image data.');
 }
 
 function textFromHtml(value: string): string {
@@ -297,21 +335,6 @@ function formatImageEndpointError(status: number, responseText: string): string 
     return `502 Bad Gateway from image endpoint${preview ? `: ${preview}` : ''}`;
   }
   return `${status} status code from image endpoint${preview ? `: ${preview}` : ''}`;
-}
-
-function isRetryableImageError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /(?:502|504|gateway|timed out|timeout|fetch failed|network)/i.test(message);
-}
-
-function buildFastFallbackImagePrompt(imagePrompt: string): string {
-  const userRequest = imagePrompt.includes('User request:') ? imagePrompt.split('User request:').pop()?.trim() : imagePrompt;
-  return [
-    'Fast generation request: create a simpler low-complexity website background.',
-    'Use broad shapes, fewer tiny details, clean negative space, and a calm center band for UI readability.',
-    'Do not include UI, screenshots, text, buttons, input boxes, logos, or browser chrome.',
-    `User request: ${userRequest ?? imagePrompt}`,
-  ].join('\n');
 }
 
 function logDirectImageRequest(event: 'start' | 'end' | 'error', data: Record<string, unknown>): void {
@@ -984,8 +1007,191 @@ function preflightAiMessageResponse(pageState: PageState, response: AiMessageRes
   return aiMessageResponseSchema.parse(response);
 }
 
+function isStructuredOutputUnsupported(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:text\.format|response_format|json_schema|structured output|unsupported|invalid parameter|invalid params|unknown field|extra fields?)/i.test(
+    message,
+  );
+}
+
+function addJsonOnlyInstruction(input: StructuredResponseInput, format: StructuredResponseFormat): StructuredResponseInput {
+  const nextInput = structuredClone(input);
+  const schemaInstruction = [
+    'Return exactly one valid JSON object and nothing else.',
+    'Do not wrap the JSON in Markdown fences.',
+    `The JSON object must match this JSON schema named "${format.name}":`,
+    JSON.stringify(format.schema),
+  ].join('\n');
+  const systemMessage = nextInput.find((message) => message.role === 'system') ?? nextInput[0];
+  systemMessage.content.push({
+    type: 'input_text',
+    text: schemaInstruction,
+  });
+  return nextInput;
+}
+
+function parsePossiblyFencedJson(outputText: string): unknown {
+  const withoutThinking = outputText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+
+  try {
+    return JSON.parse(withoutThinking);
+  } catch {
+    const fencedMatch = withoutThinking.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = fencedMatch?.[1] ?? withoutThinking.slice(withoutThinking.indexOf('{'), withoutThinking.lastIndexOf('}') + 1);
+    return JSON.parse(candidate.trim());
+  }
+}
+
+type MiniMaxResponsesProvider = {
+  apiKey?: string;
+  baseUrl: string;
+  model: string;
+  path: '/responses';
+  provider: 'minimax-responses';
+};
+
+function createMiniMaxResponsesProvider(model: string): MiniMaxResponsesProvider {
+  return {
+    apiKey: getOptionalProviderApiKey(['MINIMAX_API_KEY']),
+    baseUrl: normalizeBaseUrl(process.env.MINIMAX_BASE_URL ?? defaultMiniMaxBaseUrl),
+    model,
+    path: '/responses',
+    provider: 'minimax-responses',
+  };
+}
+
+function formatTextEndpointError(status: number, responseText: string): string {
+  if (!responseText) {
+    return `${status} status code (no body)`;
+  }
+
+  const cleaned = responseText.includes('<') ? textFromHtml(responseText) : responseText.replace(/\s+/g, ' ').trim();
+  const preview = cleaned.slice(0, 240);
+  return `${status} status code from text endpoint${preview ? `: ${preview}` : ''}`;
+}
+
+function extractResponseOutputText(parsed: unknown): string {
+  const outputText = (parsed as { output_text?: unknown }).output_text;
+  if (typeof outputText === 'string' && outputText.length > 0) {
+    return outputText;
+  }
+
+  const output = (parsed as { output?: unknown }).output;
+  if (Array.isArray(output)) {
+    const texts = output.flatMap((item) => extractContentTexts((item as { content?: unknown }).content));
+    if (texts.length > 0) {
+      return texts.join('\n');
+    }
+  }
+
+  const choiceContent = (parsed as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]?.message?.content;
+  const choiceTexts = extractContentTexts(choiceContent);
+  if (choiceTexts.length > 0) {
+    return choiceTexts.join('\n');
+  }
+
+  throw new Error('Text model did not return output text.');
+}
+
+function extractContentTexts(content: unknown): string[] {
+  if (typeof content === 'string') {
+    return [content];
+  }
+
+  if (Array.isArray(content)) {
+    return content.flatMap((part) => {
+      if (typeof part === 'string') {
+        return [part];
+      }
+      const text = (part as { text?: unknown; output_text?: unknown }).text ?? (part as { output_text?: unknown }).output_text;
+      return typeof text === 'string' ? [text] : [];
+    });
+  }
+
+  if (content && typeof content === 'object') {
+    const text = (content as { text?: unknown; output_text?: unknown }).text ?? (content as { output_text?: unknown }).output_text;
+    return typeof text === 'string' ? [text] : [];
+  }
+
+  return [];
+}
+
+async function postResponsesRequest(provider: MiniMaxResponsesProvider, body: Record<string, unknown>): Promise<unknown> {
+  const response = await fetchWithTimeout(
+    `${provider.baseUrl}${provider.path}`,
+    {
+      method: 'POST',
+      headers: withOptionalBearerAuth(
+        {
+          'Content-Type': 'application/json',
+        },
+        provider.apiKey,
+      ),
+      body: JSON.stringify(body),
+    },
+    defaultTextTimeoutMs,
+    'Text model request',
+  );
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(formatTextEndpointError(response.status, responseText));
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    throw new Error('Text endpoint returned non-JSON response.');
+  }
+}
+
+async function requestStructuredJson<T>(
+  provider: MiniMaxResponsesProvider,
+  args: StructuredJsonArgs<T>,
+): Promise<T> {
+  try {
+    const response = await postResponsesRequest(provider, {
+      model: provider.model,
+      input: args.input,
+      text: {
+        format: args.format,
+      },
+    });
+    return args.parser.parse(JSON.parse(extractResponseOutputText(response)));
+  } catch (error) {
+    if (!isStructuredOutputUnsupported(error)) {
+      throw error;
+    }
+
+    logWorkflow(args.workflowId ?? 'noctx', 'structured_output_fallback', {
+      source: args.source,
+      model: provider.model,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    const response = await postResponsesRequest(provider, {
+      model: provider.model,
+      input: addJsonOnlyInstruction(args.input, args.format),
+    });
+    return args.parser.parse(parsePossiblyFencedJson(extractResponseOutputText(response)));
+  }
+}
+
+export function createTextModelProvider(model = getTextModel()): TextModelClient {
+  if (model !== 'MiniMax-M3' && !model.startsWith('MiniMax-')) {
+    throw new Error(`Unsupported language model "${model}". Add a provider mapping in createTextModelProvider.`);
+  }
+
+  const provider = createMiniMaxResponsesProvider(model);
+  return {
+    baseUrl: provider.baseUrl,
+    model: provider.model,
+    provider: provider.provider,
+    createStructuredJson: (args) => requestStructuredJson(provider, args),
+  };
+}
+
 async function repairPatchResponseDraft(
-  client: OpenAI,
+  textProvider: TextModelClient,
   args: {
     prompt: string;
     pageState: PageState;
@@ -996,8 +1202,7 @@ async function repairPatchResponseDraft(
     extraContext?: string;
   },
 ): Promise<PatchResponseDraft> {
-  const response = await client.responses.create({
-    model: process.env.OPENAI_MODEL ?? defaultModel,
+  return textProvider.createStructuredJson({
     input: [
       {
         role: 'system',
@@ -1021,16 +1226,14 @@ async function repairPatchResponseDraft(
         ],
       },
     ],
-    text: {
-      format: modelResponseSchema,
-    },
+    format: modelResponseSchema,
+    parser: openAiPatchResponseSchema,
+    source: 'patch_repair',
   });
-
-  return openAiPatchResponseSchema.parse(JSON.parse(response.output_text));
 }
 
 async function generateCheckedPatchResponse(
-  client: OpenAI,
+  textProvider: TextModelClient,
   args: {
     prompt: string;
     pageState: PageState;
@@ -1070,7 +1273,7 @@ async function generateCheckedPatchResponse(
         break;
       }
 
-      draft = await repairPatchResponseDraft(client, {
+      draft = await repairPatchResponseDraft(textProvider, {
         prompt: args.prompt,
         pageState: args.pageState,
         transcript: args.transcript,
@@ -1179,37 +1382,110 @@ function prepareComponentBackgroundPatch(pageState: PageState, targetNodeId: str
   };
 }
 
-function dataUrlToBlob(dataUrl: string): { blob: Blob; mimeType: string } {
-  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,(.+)$/);
-  if (!match) {
-    throw new Error('Existing image background is not an editable data URL.');
-  }
+type GeminiNativeImageProvider = {
+  apiKey?: string;
+  baseUrl: string;
+  model: string;
+  path: string;
+  provider: 'gemini-native-image';
+};
 
-  const mimeType = match[1] === 'image/jpg' ? 'image/jpeg' : match[1];
+function createGeminiNativeImageProvider(model: string): GeminiNativeImageProvider {
   return {
-    blob: new Blob([Buffer.from(match[2], 'base64')], { type: mimeType }),
-    mimeType,
+    apiKey: getOptionalProviderApiKey(['GEMINI_IMAGE_API_KEY', 'GEMINI_API_KEY']),
+    baseUrl: normalizeGeminiBaseUrl(process.env.GEMINI_IMAGE_BASE_URL ?? defaultGeminiImageBaseUrl),
+    model,
+    path: `/models/${model}:generateContent`,
+    provider: 'gemini-native-image',
   };
 }
 
-async function postImageGenerationRequest(body: {
-  model: string;
-  prompt: string;
-  size: string;
-  quality: 'low' | 'medium' | 'high' | 'auto';
-  background: 'opaque';
-  output_format: 'png';
-  n: number;
-}): Promise<string> {
-  const timeoutMs = Number(process.env.OPENAI_IMAGE_TIMEOUT_MS ?? defaultImageTimeoutMs);
-  const url = `${getOpenAiBaseUrl()}/images/generations`;
+function withOptionalBearerAuth(headers: Record<string, string>, apiKey?: string): Record<string, string> {
+  return apiKey
+    ? {
+        ...headers,
+        Authorization: `Bearer ${apiKey}`,
+      }
+    : headers;
+}
+
+function withOptionalGeminiApiKey(headers: Record<string, string>, apiKey?: string): Record<string, string> {
+  return apiKey
+    ? {
+        ...headers,
+        'x-goog-api-key': apiKey,
+      }
+    : headers;
+}
+
+function buildGeminiTextToImageBody(prompt: string): Record<string, unknown> {
+  return {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          {
+            text: prompt,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildGeminiImageEditBody(prompt: string, currentImageDataUrl: string): Record<string, unknown> {
+  const { base64, mimeType } = parseImageDataUrl(currentImageDataUrl);
+  return {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          {
+            inline_data: {
+              mime_type: mimeType,
+              data: base64,
+            },
+          },
+          {
+            text: prompt,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+async function parseGeminiImageResponse(response: Response): Promise<string> {
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(formatImageEndpointError(response.status, responseText));
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch {
+    throw new Error('Image endpoint returned non-JSON response.');
+  }
+
+  return extractInlineImageDataUrl(parsed);
+}
+
+async function postGeminiImageRequest(
+  provider: GeminiNativeImageProvider,
+  body: Record<string, unknown>,
+  logBody: Record<string, unknown>,
+): Promise<string> {
+  const timeoutMs = defaultImageTimeoutMs;
+  const url = `${provider.baseUrl}${provider.path}`;
   const startedAt = Date.now();
 
   logDirectImageRequest('start', {
     method: 'POST',
-    path: '/v1/images/generations',
-    model: body.model,
-    body,
+    path: provider.path,
+    model: provider.model,
+    provider: provider.provider,
+    body: logBody,
   });
 
   try {
@@ -1217,27 +1493,32 @@ async function postImageGenerationRequest(body: {
       url,
       {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${getRequiredApiKey()}`,
-          'Content-Type': 'application/json',
-        },
+        headers: withOptionalGeminiApiKey(
+          {
+            'Content-Type': 'application/json',
+          },
+          provider.apiKey,
+        ),
         body: JSON.stringify(body),
       },
       timeoutMs,
+      'Image model request',
     );
     logDirectImageRequest('end', {
       method: 'POST',
-      path: '/v1/images/generations',
-      model: body.model,
+      path: provider.path,
+      model: provider.model,
+      provider: provider.provider,
       status: response.status,
       durationMs: Date.now() - startedAt,
     });
-    return await parseImageResponse(response);
+    return await parseGeminiImageResponse(response);
   } catch (error) {
     logDirectImageRequest('error', {
       method: 'POST',
-      path: '/v1/images/generations',
-      model: body.model,
+      path: provider.path,
+      model: provider.model,
+      provider: provider.provider,
       durationMs: Date.now() - startedAt,
       error: error instanceof Error ? error.message : String(error),
     });
@@ -1245,113 +1526,59 @@ async function postImageGenerationRequest(body: {
   }
 }
 
-async function generateImageBackground(imagePrompt: string): Promise<string> {
-  const model = process.env.OPENAI_IMAGE_MODEL ?? defaultImageModel;
-  const firstBody = {
-    model,
-    prompt: imagePrompt,
-    size: process.env.OPENAI_IMAGE_SIZE ?? defaultImageSize,
-    quality: (process.env.OPENAI_IMAGE_QUALITY as 'low' | 'medium' | 'high' | 'auto' | undefined) ?? 'medium',
-    background: 'opaque' as const,
-    output_format: 'png' as const,
-    n: 1,
-  };
-
-  try {
-    return await postImageGenerationRequest(firstBody);
-  } catch (error) {
-    if (process.env.OPENAI_IMAGE_FAST_RETRY === 'false' || !isRetryableImageError(error)) {
-      throw error;
-    }
-
-    logDirectImageRequest('start', {
-      method: 'POST',
-      path: '/v1/images/generations',
-      model,
-      retry: 'fast_fallback',
-      reason: error instanceof Error ? error.message : String(error),
-    });
-
-    return postImageGenerationRequest({
-      ...firstBody,
-      prompt: buildFastFallbackImagePrompt(imagePrompt),
-      quality: 'low',
-    });
-  }
-}
-
-async function editImageBackground(imagePrompt: string, currentImageDataUrl: string): Promise<string> {
-  const model = process.env.OPENAI_IMAGE_MODEL ?? defaultImageModel;
-  const timeoutMs = Number(process.env.OPENAI_IMAGE_TIMEOUT_MS ?? defaultImageTimeoutMs);
-  const url = `${getOpenAiBaseUrl()}/images/edits`;
-  const { blob, mimeType } = dataUrlToBlob(currentImageDataUrl);
-  const formData = new FormData();
-  formData.set('model', model);
-  formData.set('image', blob, `current-background.${mimeType.split('/')[1] ?? 'png'}`);
-  formData.set('prompt', imagePrompt);
-  formData.set('size', process.env.OPENAI_IMAGE_SIZE ?? defaultImageSize);
-  formData.set('quality', (process.env.OPENAI_IMAGE_QUALITY as 'low' | 'medium' | 'high' | 'auto' | undefined) ?? 'medium');
-  formData.set('background', 'opaque');
-  formData.set('output_format', 'png');
-  formData.set('n', '1');
-  const startedAt = Date.now();
-
-  logDirectImageRequest('start', {
-    method: 'POST',
-    path: '/v1/images/edits',
-    model,
-    body: {
-      model,
-      prompt: imagePrompt,
-      size: process.env.OPENAI_IMAGE_SIZE ?? defaultImageSize,
-      quality: (process.env.OPENAI_IMAGE_QUALITY as 'low' | 'medium' | 'high' | 'auto' | undefined) ?? 'medium',
-      background: 'opaque',
-      output_format: 'png',
-      n: 1,
-      image: `[${mimeType} blob bytes=${blob.size}]`,
-    },
+async function generateImageBackgroundForProvider(provider: GeminiNativeImageProvider, imagePrompt: string): Promise<string> {
+  return postGeminiImageRequest(provider, buildGeminiTextToImageBody(imagePrompt), {
+    contents: [{ role: 'user', parts: [{ text: imagePrompt }] }],
   });
+}
 
-  try {
-    const response = await fetchWithTimeout(
-      url,
+async function editImageBackgroundForProvider(
+  provider: GeminiNativeImageProvider,
+  imagePrompt: string,
+  currentImageDataUrl: string,
+): Promise<string> {
+  const { mimeType } = parseImageDataUrl(currentImageDataUrl);
+  return postGeminiImageRequest(provider, buildGeminiImageEditBody(imagePrompt, currentImageDataUrl), {
+    contents: [
       {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${getRequiredApiKey()}`,
-        },
-        body: formData,
+        role: 'user',
+        parts: [
+          {
+            inline_data: {
+              mime_type: mimeType,
+              data: `[image-data-url length=${currentImageDataUrl.length}]`,
+            },
+          },
+          {
+            text: imagePrompt,
+          },
+        ],
       },
-      timeoutMs,
-    );
-    logDirectImageRequest('end', {
-      method: 'POST',
-      path: '/v1/images/edits',
-      model,
-      status: response.status,
-      durationMs: Date.now() - startedAt,
-    });
-    return await parseImageResponse(response);
-  } catch (error) {
-    logDirectImageRequest('error', {
-      method: 'POST',
-      path: '/v1/images/edits',
-      model,
-      durationMs: Date.now() - startedAt,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    throw error;
+    ],
+  });
+}
+
+export function createImageModelProvider(model = getImageModel()): ImageModelClient {
+  if (model !== 'gemini-3.1-flash-image' && !model.startsWith('gemini-')) {
+    throw new Error(`Unsupported image model "${model}". Add a provider mapping in createImageModelProvider.`);
   }
+
+  const provider = createGeminiNativeImageProvider(model);
+  return {
+    model: provider.model,
+    provider: provider.provider,
+    generateBackground: (prompt) => generateImageBackgroundForProvider(provider, prompt),
+    editBackground: (prompt, currentImageDataUrl) => editImageBackgroundForProvider(provider, prompt, currentImageDataUrl),
+  };
 }
 
 async function generateWorkflowPlan(
-  client: OpenAI,
+  textProvider: TextModelClient,
   prompt: string,
   pageState: PageState,
   transcript: string,
 ): Promise<WorkflowPlan> {
-  const response = await client.responses.create({
-    model: process.env.OPENAI_MODEL ?? defaultModel,
+  const rawPlan = await textProvider.createStructuredJson({
     input: [
       {
         role: 'system',
@@ -1373,22 +1600,21 @@ async function generateWorkflowPlan(
         ],
       },
     ],
-    text: {
-      format: workflowPlanResponseSchema,
-    },
+    format: workflowPlanResponseSchema,
+    parser: z.record(z.unknown()),
+    source: 'planner',
   });
 
-  const rawPlan = JSON.parse(response.output_text);
   const normalized = {
     ...rawPlan,
-    targetNodeId: rawPlan.targetNodeId ?? undefined,
-    imagePrompt: rawPlan.imagePrompt ?? undefined,
+    targetNodeId: typeof rawPlan.targetNodeId === 'string' ? rawPlan.targetNodeId : undefined,
+    imagePrompt: typeof rawPlan.imagePrompt === 'string' ? rawPlan.imagePrompt : undefined,
   };
   return workflowPlanSchema.parse(normalized);
 }
 
 async function finalizeWorkflowPatch(
-  client: OpenAI,
+  textProvider: TextModelClient,
   prompt: string,
   pageState: PageState,
   transcript: string,
@@ -1399,7 +1625,7 @@ async function finalizeWorkflowPatch(
 ): Promise<AiMessageResponse> {
   const modelSafeToolResults = sanitizeToolResultsForModel(toolResults, imageRefs);
   const repairOnlyInstruction = buildRepairOnlyInstruction(prompt);
-  return generateCheckedPatchResponse(client, {
+  return generateCheckedPatchResponse(textProvider, {
     prompt,
     pageState,
     transcript,
@@ -1408,8 +1634,7 @@ async function finalizeWorkflowPatch(
     workflowId,
     extraContext: `Tool results:\n${JSON.stringify(modelSafeToolResults)}`,
     createDraft: async () => {
-      const response = await client.responses.create({
-        model: process.env.OPENAI_MODEL ?? defaultModel,
+      const parsed = await textProvider.createStructuredJson({
         input: [
           {
             role: 'system',
@@ -1434,12 +1659,11 @@ async function finalizeWorkflowPatch(
             ],
           },
         ],
-        text: {
-          format: modelResponseSchema,
-        },
+        format: modelResponseSchema,
+        parser: openAiPatchResponseSchema,
+        workflowId,
+        source: 'finalizer',
       });
-
-      const parsed = openAiPatchResponseSchema.parse(JSON.parse(response.output_text));
       const restoredPatchJson = restoreImageRefs(parsed.patchJson, imageRefs);
       if (typeof restoredPatchJson !== 'string') {
         throw new Error('AI returned an invalid page patch.');
@@ -1886,7 +2110,7 @@ function buildMockPatch(prompt: string, pageState: PageState): AiMessageResponse
 }
 
 async function runAiWorkflow(
-  client: OpenAI,
+  textProvider: TextModelClient,
   prompt: string,
   pageState: PageState,
   messages: ConversationMessage[],
@@ -1905,8 +2129,8 @@ async function runAiWorkflow(
   logWorkflow(workflowId, 'start', { promptLength: prompt.length });
 
   const planStartedAt = Date.now();
-  logWorkflow(workflowId, 'tool_call', { tool: 'planner', model: process.env.OPENAI_MODEL ?? defaultModel });
-  const plan = await generateWorkflowPlan(client, prompt, pageState, transcript);
+  logWorkflow(workflowId, 'tool_call', { tool: 'planner', model: textProvider.model, provider: textProvider.provider });
+  const plan = await generateWorkflowPlan(textProvider, prompt, pageState, transcript);
   logWorkflow(workflowId, 'tool_result', {
     tool: 'planner',
     ok: true,
@@ -1937,10 +2161,10 @@ async function runAiWorkflow(
 
   if (!plan.needsImage) {
     const directStartedAt = Date.now();
-    logWorkflow(workflowId, 'tool_call', { tool: 'direct_patch', model: process.env.OPENAI_MODEL ?? defaultModel });
+    logWorkflow(workflowId, 'tool_call', { tool: 'direct_patch', model: textProvider.model, provider: textProvider.provider });
     let directResponse: AiMessageResponse;
     try {
-      directResponse = await generateDirectPatchResponse(client, prompt, pageState, transcript, plan, workflowId);
+      directResponse = await generateDirectPatchResponse(textProvider, prompt, pageState, transcript, plan, workflowId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logWorkflow(workflowId, 'tool_result', {
@@ -1985,6 +2209,7 @@ async function runAiWorkflow(
   }
 
   if (plan.needsImage) {
+    const imageClient = createImageModelProvider();
     const targetNode = plan.targetNodeId ? findNodeById(pageState.root, plan.targetNodeId) : undefined;
     const imagePrompt =
       plan.target === 'component'
@@ -2004,14 +2229,15 @@ async function runAiWorkflow(
       const imageStartedAt = Date.now();
       logWorkflow(workflowId, 'tool_call', {
         tool: shouldEditPageImage ? 'edit_image' : 'generate_image',
-        model: process.env.OPENAI_IMAGE_MODEL ?? defaultImageModel,
+        model: imageClient.model,
+        provider: imageClient.provider,
         target: plan.target,
         targetNodeId: plan.targetNodeId ?? null,
         promptLength: imagePrompt.length,
       });
       const imageDataUrl = shouldEditPageImage
-        ? await editImageBackground(imagePrompt, existingImageSrc)
-        : await generateImageBackground(imagePrompt);
+        ? await imageClient.editBackground(imagePrompt, existingImageSrc)
+        : await imageClient.generateBackground(imagePrompt);
       const imageRef = addImageRef(imageRefs, imageDataUrl);
       const imageResult: WorkflowToolResult = { ok: true, data: { imageDataUrl, imageRef } };
       toolResults.push({ tool: shouldEditPageImage ? 'edit_image' : 'generate_image', result: imageResult });
@@ -2120,7 +2346,8 @@ async function runAiWorkflow(
     const finalizerStartedAt = Date.now();
     logWorkflow(workflowId, 'tool_call', {
       tool: 'finalizer',
-      model: process.env.OPENAI_MODEL ?? defaultModel,
+      model: textProvider.model,
+      provider: textProvider.provider,
       toolResultCount: toolResults.length,
       imageRefCount: imageRefs.size,
     });
@@ -2128,7 +2355,7 @@ async function runAiWorkflow(
       prompt,
       pageState,
       plan,
-      await finalizeWorkflowPatch(client, prompt, pageState, transcript, plan, toolResults, imageRefs, workflowId),
+      await finalizeWorkflowPatch(textProvider, prompt, pageState, transcript, plan, toolResults, imageRefs, workflowId),
     );
     const checkedFinalResponse = preflightAiMessageResponse(pageState, finalResponse);
     logWorkflow(workflowId, 'tool_result', {
@@ -2195,27 +2422,17 @@ export async function generateAssistantResponse(
   messages: ConversationMessage[],
   context: AiRequestContext = {},
 ): Promise<AiMessageResponse> {
-  let client: OpenAI;
-  try {
-    client = getClient();
-  } catch (error) {
-    if (error instanceof Error && error.message === 'AI_MOCK_ENABLED') {
-      // Tests keep using a deterministic local patch without requiring a real API key.
-      return buildMockPatch(prompt, pageState);
-    }
-    throw error;
-  }
-
-  if (process.env.USE_AI_MOCK === 'true') {
+  if ((process.env.NODE_ENV === 'test' && process.env.USE_AI_MOCK !== 'false') || process.env.USE_AI_MOCK === 'true') {
     return buildMockPatch(prompt, pageState);
   }
 
-  const response = await runAiWorkflow(client, prompt, pageState, messages, context);
+  const textProvider = createTextModelProvider();
+  const response = await runAiWorkflow(textProvider, prompt, pageState, messages, context);
   return aiMessageResponseSchema.parse(response);
 }
 
 async function generateDirectPatchResponse(
-  client: OpenAI,
+  textProvider: TextModelClient,
   prompt: string,
   pageState: PageState,
   transcript: string,
@@ -2223,7 +2440,7 @@ async function generateDirectPatchResponse(
   workflowId?: string,
 ): Promise<AiMessageResponse> {
   const repairOnlyInstruction = buildRepairOnlyInstruction(prompt);
-  return generateCheckedPatchResponse(client, {
+  return generateCheckedPatchResponse(textProvider, {
     prompt,
     pageState,
     transcript,
@@ -2234,8 +2451,7 @@ async function generateDirectPatchResponse(
       'Valid patchJson example:\n' +
       '[{"type":"add_node","target":{"parentId":"root","index":0},"node":{"id":"example-card","type":"card","props":{"title":"Example","subtitle":"Safe component patch"},"styleTokens":{"padding":"32px","radius":"28px"},"children":[]}}]',
     createDraft: async () => {
-      const response = await client.responses.create({
-        model: process.env.OPENAI_MODEL ?? defaultModel,
+      return textProvider.createStructuredJson({
         input: [
           {
             role: 'system',
@@ -2260,12 +2476,11 @@ async function generateDirectPatchResponse(
             ],
           },
         ],
-        text: {
-          format: modelResponseSchema,
-        },
+        format: modelResponseSchema,
+        parser: openAiPatchResponseSchema,
+        workflowId,
+        source: 'direct_patch',
       });
-
-      return openAiPatchResponseSchema.parse(JSON.parse(response.output_text));
     },
   });
 }
