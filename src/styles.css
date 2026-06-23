@@ -103,14 +103,35 @@ textarea {
 
 .app-shell--canvas {
   position: relative;
+  height: 100vh;
+  min-height: 100vh;
   overflow: hidden;
+  --canvas-floating-control-offset: calc(clamp(18px, 3vh, 30px) + env(safe-area-inset-bottom, 0px));
+  --canvas-floating-control-safe-area: clamp(12px, 2vh, 24px);
 }
 
 .canvas-background {
   position: absolute;
   inset: 0;
   z-index: 0;
+  isolation: isolate;
+  overflow: hidden;
   pointer-events: auto;
+}
+
+.canvas-overlay-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 100000;
+  pointer-events: none;
+}
+
+.app-shell--canvas .page-renderer {
+  min-height: 100% !important;
+  height: 100%;
+  padding: clamp(20px, 4vh, 40px) 32px var(--canvas-floating-control-safe-area);
+  scroll-padding: clamp(20px, 4vh, 40px) 32px var(--canvas-floating-control-safe-area);
+  justify-content: flex-start;
 }
 
 .interaction-stage {
@@ -123,7 +144,12 @@ textarea {
 }
 
 .interaction-stage--canvas {
-  background: radial-gradient(circle at center, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0));
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  display: block;
+  padding: 0;
+  background: transparent;
   pointer-events: none;
 }
 
@@ -136,7 +162,28 @@ textarea {
 }
 
 .composer-stage--canvas {
-  width: var(--prompt-width, min(720px, calc(100vw - 32px)));
+  width: min(380px, calc(100vw - 40px));
+  max-width: min(380px, calc(100vw - 40px));
+}
+
+.composer-stage--canvas .prompt-composer {
+  width: 100%;
+  border-color: rgba(255, 255, 255, 0.44);
+  background: rgba(255, 255, 255, 0.48);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    0 8px 24px rgba(17, 17, 17, 0.045);
+  backdrop-filter: blur(14px) saturate(1.05);
+}
+
+.composer-stage--dock {
+  position: absolute;
+  left: clamp(20px, 4vw, 46px);
+  bottom: var(--canvas-floating-control-offset);
+  z-index: 100100;
+  transform: none;
+  margin: 0;
+  padding: 0;
 }
 
 .composer-stage--bottom,
@@ -188,6 +235,10 @@ textarea {
   animation: prompt-flight-out 1800ms cubic-bezier(0.18, 0.76, 0.26, 1) forwards;
 }
 
+.canvas-overlay-layer .prompt-flight {
+  position: absolute;
+}
+
 .text-response {
   position: fixed;
   left: 50%;
@@ -213,6 +264,10 @@ textarea {
   animation: text-response-in 520ms ease both;
 }
 
+.canvas-overlay-layer .text-response {
+  position: absolute;
+}
+
 .text-response p {
   width: 100%;
   max-width: 100%;
@@ -235,17 +290,56 @@ textarea {
   position: relative;
   z-index: 1;
   width: min(760px, calc(100vw - 48px));
-  min-height: 280px;
   pointer-events: auto;
 }
 
 .generated-component-frame {
   display: block;
+  position: relative;
   width: 100%;
   min-height: inherit;
-  height: 100%;
+  height: auto;
   border: 0;
   background: transparent;
+}
+
+.generated-component-frame--background {
+  padding: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.58);
+  border-radius: 28px;
+  box-shadow: 0 24px 70px rgba(20, 20, 20, 0.1);
+  overflow: hidden;
+}
+
+.generated-component-frame__iframe {
+  display: block;
+  width: 100%;
+  min-height: inherit;
+  border: 0;
+  background: transparent;
+}
+
+.generated-component-frame--background .generated-component-frame__iframe {
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.38);
+  backdrop-filter: blur(8px);
+}
+
+.generated-component-frame__error {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(184, 50, 50, 0.28);
+  border-radius: 8px;
+  background: rgba(255, 245, 245, 0.94);
+  color: #7f1d1d;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.generated-component-frame__error strong {
+  font-size: 13px;
 }
 
 @keyframes text-response-in {
@@ -346,6 +440,10 @@ textarea {
   color: rgba(130, 130, 130, 0.42);
   opacity: var(--timeline-opacity, 1);
   animation: timeline-rail-in 900ms ease forwards;
+}
+
+.canvas-overlay-layer .timeline-rail {
+  position: absolute;
 }
 
 .timeline-rail--left {
@@ -575,9 +673,8 @@ textarea {
   align-items: center;
   justify-content: center;
   gap: 24px;
-  opacity: 0.66;
-  filter: saturate(0.88);
   overflow: auto;
+  background: transparent;
 }
 
 .page-renderer section,
@@ -602,6 +699,17 @@ textarea {
 
 .render-columns {
   align-items: start;
+  width: min(1120px, 100%);
+  gap: 24px;
+}
+
+.render-columns > * {
+  min-width: 0;
+}
+
+.render-columns > .generated-component-shell {
+  width: 100% !important;
+  max-width: 100% !important;
 }
 
 .render-list {

@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import express from 'express';
 import {
+  apiErrorResponseSchema,
+  debugTraceRecordSchema,
+  debugTraceSummarySchema,
   sessionHistoryResponseSchema,
   sessionJumpRequestSchema,
   sessionMessageRequestSchema,
@@ -10,15 +13,23 @@ import {
 } from '../src/shared/types';
 import { validateAndApplyAiResponse, generateAssistantResponse } from './ai';
 import {
-  addUserMessage,
   applyAssistantResponse,
   createSession,
+  createTransientUserMessage,
   getSession,
   jumpToSnapshot,
   redoSession,
   undoSession,
 } from './sessionStore';
-import { logLine, runWithLogContext } from './logger';
+import {
+  finishTrace,
+  getTraceRecord,
+  listTraceSummaries,
+  logEvent,
+  readLogLines,
+  runWithLogContext,
+  startTrace,
+} from './logger';
 
 function shouldLogServerRequests(): boolean {
   return process.env.NODE_ENV !== 'test' && process.env.AI_DEBUG_REQUESTS !== 'false';
@@ -33,7 +44,16 @@ function logMessageRequest(requestId: string, event: string, data: Record<string
   if (!shouldLogServerRequests()) {
     return;
   }
-  logLine(`[server:message:${requestId}] ${event} ${JSON.stringify(data)}`);
+  logEvent({
+    event: `server.message.${event}`,
+    requestId,
+    status: event === 'start' ? 'start' : event === 'success' ? 'success' : event === 'error' ? 'error' : 'info',
+    ...data,
+  });
+}
+
+function isDebugApiEnabled(): boolean {
+  return process.env.NODE_ENV !== 'production' || process.env.AI_DEBUG_API === 'true';
 }
 
 export function createApp() {
@@ -43,6 +63,45 @@ export function createApp() {
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.get('/api/debug/traces', (_req, res) => {
+    if (!isDebugApiEnabled()) {
+      res.status(404).json({ error: 'Debug API disabled' });
+      return;
+    }
+
+    res.json({
+      traces: debugTraceSummarySchema.array().parse(listTraceSummaries()),
+    });
+  });
+
+  app.get('/api/debug/traces/:requestId', (req, res) => {
+    if (!isDebugApiEnabled()) {
+      res.status(404).json({ error: 'Debug API disabled' });
+      return;
+    }
+
+    const trace = getTraceRecord(req.params.requestId);
+    if (!trace) {
+      res.status(404).json({ error: 'Trace not found' });
+      return;
+    }
+
+    res.json(debugTraceRecordSchema.parse(trace));
+  });
+
+  app.get('/api/debug/logs', (req, res) => {
+    if (!isDebugApiEnabled()) {
+      res.status(404).json({ error: 'Debug API disabled' });
+      return;
+    }
+
+    const requestId = typeof req.query.requestId === 'string' ? req.query.requestId : undefined;
+    const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    res.json({
+      lines: readLogLines({ requestId, limit }),
+    });
   });
 
   app.post('/api/session/start', (_req, res) => {
@@ -58,19 +117,29 @@ export function createApp() {
       try {
         const body = sessionMessageRequestSchema.parse(req.body);
         sessionId = body.sessionId;
+        startTrace(requestId, {
+          sessionId,
+          prompt: previewPrompt(body.prompt),
+        });
         logMessageRequest(requestId, 'start', {
           sessionId,
           promptLength: body.prompt.length,
           prompt: previewPrompt(body.prompt),
         });
-        addUserMessage(body.sessionId, body.prompt);
         const session = getSession(body.sessionId);
-        const aiResponse = await generateAssistantResponse(body.prompt, session.pageState, session.messages, { requestId });
+        const transientUserMessage = createTransientUserMessage(body.prompt);
+        const aiResponse = await generateAssistantResponse(
+          body.prompt,
+          session.pageState,
+          [...session.messages, transientUserMessage],
+          { requestId },
+        );
         if (aiResponse.error) {
           throw new Error(aiResponse.error);
         }
         const nextPageState = validateAndApplyAiResponse(session.pageState, aiResponse);
-        const response = applyAssistantResponse(body.sessionId, aiResponse, nextPageState);
+        const response = applyAssistantResponse(body.sessionId, body.prompt, aiResponse, nextPageState);
+        finishTrace(requestId, 'success', undefined, Date.now() - startedAt);
         logMessageRequest(requestId, 'success', {
           sessionId,
           durationMs: Date.now() - startedAt,
@@ -80,14 +149,17 @@ export function createApp() {
         res.json(sessionMessageResponseSchema.parse(response));
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown server error';
+        finishTrace(requestId, 'error', message, Date.now() - startedAt);
         logMessageRequest(requestId, 'error', {
           sessionId,
           durationMs: Date.now() - startedAt,
           error: message,
         });
-        res.status(400).json({
+        res.status(400).json(apiErrorResponseSchema.parse({
           error: message,
-        });
+          requestId,
+          retryable: true,
+        }));
       }
     });
   });

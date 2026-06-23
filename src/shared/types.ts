@@ -141,6 +141,18 @@ export const behaviorSchema = z
 
 export type BehaviorConfig = z.infer<typeof behaviorSchema>;
 
+export const generatedComponentMetaSchema = z
+  .object({
+    category: z.string().optional(),
+    archetype: z.string().optional(),
+    userVisibleGoal: z.string().optional(),
+    behavioralRequirements: z.array(z.string()).optional(),
+    acceptanceCriteria: z.array(z.string()).optional(),
+  })
+  .strict();
+
+export type GeneratedComponentMeta = z.infer<typeof generatedComponentMetaSchema>;
+
 export type PageNode = {
   id: string;
   type: ComponentType;
@@ -155,7 +167,20 @@ export const pageNodeSchema: z.ZodTypeAny = z.lazy(() =>
     .object({
       id: z.string(),
       type: componentTypeSchema,
-      props: z.record(z.unknown()),
+      props: z.record(z.unknown()).superRefine((value, ctx) => {
+        if (!Object.prototype.hasOwnProperty.call(value, 'componentMeta')) {
+          return;
+        }
+        const parsed = generatedComponentMetaSchema.safeParse(value.componentMeta);
+        if (!parsed.success) {
+          for (const issue of parsed.error.issues) {
+            ctx.addIssue({
+              ...issue,
+              path: ['componentMeta', ...issue.path],
+            });
+          }
+        }
+      }),
       styleTokens: styleTokensSchema.default({}),
       behavior: behaviorSchema.optional(),
       children: z.array(pageNodeSchema).default([]),
@@ -199,7 +224,12 @@ const updateNodePatchBaseSchema = z
   .strict();
 
 export const updateNodePatchSchema = updateNodePatchBaseSchema.superRefine((value, ctx) => {
-  if (value.props === undefined && value.styleTokens === undefined && value.behavior === undefined) {
+  const hasProps = value.props !== undefined && Object.keys(value.props).length > 0;
+  const hasStyleTokens = value.styleTokens !== undefined && Object.keys(value.styleTokens).length > 0;
+  const hasBehavior =
+    value.behavior !== undefined &&
+    Object.entries(value.behavior).some(([key, nestedValue]) => !(key === 'kind' && nestedValue === 'none') && nestedValue !== undefined);
+  if (!hasProps && !hasStyleTokens && !hasBehavior) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'update_node requires props, styleTokens, or behavior',
@@ -258,6 +288,56 @@ export const aiMessageResponseSchema = z
   .strict();
 
 export type AiMessageResponse = z.infer<typeof aiMessageResponseSchema>;
+
+export const apiErrorResponseSchema = z
+  .object({
+    error: z.string(),
+    requestId: z.string(),
+    retryable: z.boolean(),
+  })
+  .strict();
+
+export type ApiErrorResponse = z.infer<typeof apiErrorResponseSchema>;
+
+export const workflowTraceStepSchema = z
+  .object({
+    timestamp: z.string(),
+    requestId: z.string(),
+    type: z.string(),
+    name: z.string(),
+    status: z.enum(['start', 'success', 'error', 'info']),
+    durationMs: z.number().optional(),
+    model: z.string().optional(),
+    provider: z.string().optional(),
+    inputSummary: z.unknown().optional(),
+    outputSummary: z.unknown().optional(),
+    error: z.string().optional(),
+  })
+  .strict();
+
+export type WorkflowTraceStep = z.infer<typeof workflowTraceStepSchema>;
+
+export const debugTraceSummarySchema = z
+  .object({
+    requestId: z.string(),
+    sessionId: z.string().optional(),
+    prompt: z.string().optional(),
+    status: z.enum(['running', 'success', 'error']),
+    startedAt: z.string(),
+    updatedAt: z.string(),
+    durationMs: z.number().optional(),
+    stepCount: z.number().int().nonnegative(),
+    error: z.string().optional(),
+  })
+  .strict();
+
+export type DebugTraceSummary = z.infer<typeof debugTraceSummarySchema>;
+
+export const debugTraceRecordSchema = debugTraceSummarySchema.extend({
+  steps: z.array(workflowTraceStepSchema),
+});
+
+export type DebugTraceRecord = z.infer<typeof debugTraceRecordSchema>;
 
 export const conversationMessageSchema = z
   .object({

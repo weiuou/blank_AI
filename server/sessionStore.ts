@@ -36,6 +36,15 @@ function createSystemMessage(): ConversationMessage {
   };
 }
 
+function createConversationMessage(role: ConversationMessage['role'], content: string): ConversationMessage {
+  return {
+    id: randomUUID(),
+    role,
+    content,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 function createSnapshot(
   index: number,
   pageState: PageState,
@@ -105,21 +114,17 @@ export function getSession(sessionId: string): SessionRecord {
   return session;
 }
 
-export function addUserMessage(sessionId: string, content: string): ConversationMessage {
-  const message: ConversationMessage = {
-    id: randomUUID(),
-    role: 'user',
-    content,
-    timestamp: new Date().toISOString(),
-  };
-  const session = getSession(sessionId);
-  session.messages.push(message);
-  return message;
+export function createTransientUserMessage(content: string): ConversationMessage {
+  return createConversationMessage('user', content);
 }
 
-export function applyAssistantResponse(sessionId: string, response: AiMessageResponse, nextPageState: PageState): SessionMessageResponse {
+export function applyAssistantResponse(
+  sessionId: string,
+  prompt: string,
+  response: AiMessageResponse,
+  nextPageState: PageState,
+): SessionMessageResponse {
   const session = getSession(sessionId);
-  const latestUserPrompt = [...session.messages].reverse().find((message) => message.role === 'user')?.content ?? '页面更新';
   session.undoStack.push(structuredClone(session.pageState));
   session.redoStack = [];
   session.pageState = nextPageState;
@@ -128,19 +133,15 @@ export function applyAssistantResponse(sessionId: string, response: AiMessageRes
   const nextSnapshot = createSnapshot(
     session.snapshots.length,
     nextPageState,
-    latestUserPrompt,
+    prompt,
     `第 ${session.snapshots.length} 轮`,
     response.assistantText,
     hasPageChange,
   );
   session.snapshots.push(nextSnapshot);
   session.activeSnapshotId = nextSnapshot.id;
-  session.messages.push({
-    id: randomUUID(),
-    role: 'assistant',
-    content: response.assistantText,
-    timestamp: new Date().toISOString(),
-  });
+  session.messages.push(createConversationMessage('user', prompt));
+  session.messages.push(createConversationMessage('assistant', response.assistantText));
 
   return {
     ...responseBase(session),

@@ -1,8 +1,24 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { createInitialPageState } from './shared/defaults';
+import type { PageNode } from './shared/types';
+
+function getGeneratedIframe(name: string): HTMLIFrameElement {
+  return screen.getByTitle(name) as HTMLIFrameElement;
+}
+
+function dispatchSandboxMessage(iframe: HTMLIFrameElement, data: unknown) {
+  act(() => {
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data,
+        source: iframe.contentWindow,
+      }),
+    );
+  });
+}
 
 const sessionStartPayload = {
   sessionId: 'session-1',
@@ -171,7 +187,7 @@ const generatedHooksComponentPayload = {
           props: {
             name: 'HookTimer',
             code:
-              "const state = React.useState(7);\nconst seconds = state[0];\nreturn React.createElement('div', null, 'Hook timer: ' + seconds);",
+              "const state = useState(7);\nconst titleRef = useRef('Hook timer');\nconst seconds = state[0];\nreturn createElement('div', null, titleRef.current + ': ' + seconds);",
             mountProps: {},
             capabilities: [],
           },
@@ -199,6 +215,44 @@ const generatedHooksComponentPayload = {
     changeSummary: 'Added generated hook component.',
     patch: [],
   },
+};
+
+const generatedBackgroundComponentPayload = {
+  ...generatedComponentPayload,
+  pageState: {
+    ...sessionStartPayload.pageState,
+    root: {
+      ...sessionStartPayload.pageState.root,
+      children: [
+        ...sessionStartPayload.pageState.root.children,
+        {
+          id: 'generated-background-component-1',
+          type: 'generated_react_component',
+          props: {
+            name: 'BackgroundWidget',
+            code: "return React.createElement('div', null, 'Widget with host background')",
+            mountProps: { backgroundImage: 'data:image/png;base64,abc123' },
+            capabilities: [],
+          },
+          styleTokens: { width: 'min(520px, calc(100vw - 48px))', minHeight: '180px' },
+          children: [],
+        },
+      ],
+    },
+  },
+  snapshots: [
+    ...sessionStartPayload.snapshots,
+    {
+      id: 'snapshot-background-component-1',
+      index: 1,
+      prompt: '给组件加背景',
+      label: '第 1 轮',
+      createdAt: '2026-06-16T00:00:01.000Z',
+      assistantText: 'I updated the component background.',
+      hasPageChange: true,
+    },
+  ],
+  activeSnapshotId: 'snapshot-background-component-1',
 };
 
 const generatedInteractiveComponentPayload = {
@@ -243,6 +297,56 @@ const generatedInteractiveComponentPayload = {
     changeSummary: 'Added generated interactive component.',
     patch: [],
   },
+};
+
+const generatedTwoComponentsPayload = {
+  ...generatedComponentPayload,
+  pageState: {
+    ...sessionStartPayload.pageState,
+    root: {
+      ...sessionStartPayload.pageState.root,
+      children: [
+        ...sessionStartPayload.pageState.root.children,
+        {
+          id: 'generated-component-1',
+          type: 'generated_react_component',
+          props: {
+            name: 'LiveWidget',
+            code: "return React.createElement('div', null, 'Live generated widget')",
+            mountProps: {},
+            capabilities: [],
+          },
+          styleTokens: { width: 'min(520px, calc(100vw - 48px))', minHeight: '180px' },
+          children: [],
+        },
+        {
+          id: 'generated-component-2',
+          type: 'generated_react_component',
+          props: {
+            name: 'SecondWidget',
+            code: "return React.createElement('div', null, 'Second generated widget')",
+            mountProps: {},
+            capabilities: [],
+          },
+          styleTokens: { width: 'min(720px, calc(100vw - 48px))', minHeight: '280px' },
+          children: [],
+        },
+      ],
+    },
+  },
+  snapshots: [
+    ...sessionStartPayload.snapshots,
+    {
+      id: 'snapshot-generated-2',
+      index: 1,
+      prompt: '生成两个组件',
+      label: '第 1 轮',
+      createdAt: '2026-06-16T00:00:01.000Z',
+      assistantText: 'I generated two sandboxed components.',
+      hasPageChange: true,
+    },
+  ],
+  activeSnapshotId: 'snapshot-generated-2',
 };
 
 describe('App', () => {
@@ -442,7 +546,7 @@ describe('App', () => {
         ...sessionStartPayload.pageState,
         root: {
           ...sessionStartPayload.pageState.root,
-          children: sessionStartPayload.pageState.root.children.map((node) =>
+          children: sessionStartPayload.pageState.root.children.map((node: PageNode) =>
             node.id === 'system-prompt'
               ? {
                   ...node,
@@ -505,11 +609,118 @@ describe('App', () => {
     await user.keyboard('{Enter}');
 
     await waitFor(() => expect(screen.getByRole('group', { name: 'LiveWidget' })).toBeInTheDocument());
-    expect(screen.getByText('Live generated widget')).toBeInTheDocument();
+    const iframe = getGeneratedIframe('LiveWidget');
+    expect(iframe).toHaveAttribute('sandbox', 'allow-scripts');
+    expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
+    expect(iframe.srcdoc).toContain('INIT_COMPONENT');
+    expect(screen.queryByText('Live generated widget')).not.toBeInTheDocument();
     expect(document.querySelector('.generated-component-shell')).toBeInTheDocument();
+    expect(document.querySelector('.composer-stage--dock')).toBeInTheDocument();
+    expect(document.querySelector('.composer-stage--center')).not.toBeInTheDocument();
+    expect(document.querySelector('.canvas-background')?.contains(document.querySelector('.composer-stage--dock'))).toBe(true);
+    expect(document.querySelector('.page-renderer')?.contains(document.querySelector('.composer-stage--dock'))).toBe(false);
+    expect(document.querySelector('.interaction-stage--canvas')?.contains(document.querySelector('.composer-stage--dock'))).toBe(true);
   });
 
-  it('allows generated React components to use hooks', async () => {
+  it('keeps generated canvas content and prompt dock in the same canvas without mixing render layers', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => sessionStartPayload,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => generatedTwoComponentsPayload,
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByLabelText(/prompt input/i)).toBeInTheDocument());
+    await user.type(screen.getByLabelText(/prompt input/i), '生成两个组件');
+    await user.keyboard('{Enter}');
+
+    await waitFor(() => expect(screen.getByRole('group', { name: 'SecondWidget' })).toBeInTheDocument());
+    expect(document.querySelectorAll('.generated-component-shell')).toHaveLength(2);
+    expect(document.querySelector('.canvas-background')?.contains(document.querySelector('.composer-stage--dock'))).toBe(true);
+    expect(document.querySelector('.page-renderer')?.contains(document.querySelector('.composer-stage--dock'))).toBe(false);
+    expect(document.querySelector('.app-shell--canvas')).toBeInTheDocument();
+    expect(document.querySelector('.app-shell--canvas')?.children).toHaveLength(1);
+    expect(document.querySelector('.canvas-background')?.children).toHaveLength(2);
+    expect(document.querySelector('.canvas-background')?.children[0]).toBe(document.querySelector('.page-renderer'));
+    expect(document.querySelector('.canvas-background')?.children[1]).toBe(document.querySelector('.canvas-overlay-layer'));
+    expect(document.querySelector('.canvas-overlay-layer')?.contains(document.querySelector('.composer-stage--dock'))).toBe(true);
+    expect(document.querySelector('.canvas-overlay-layer')?.contains(document.querySelector('.page-renderer'))).toBe(false);
+    expect(document.querySelector('.interaction-stage--canvas')?.children).toContain(document.querySelector('.composer-stage--dock'));
+  });
+
+  it('keeps generated components visible when their sandbox reports a runtime error', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => sessionStartPayload,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => generatedComponentPayload,
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByLabelText(/prompt input/i)).toBeInTheDocument());
+    await user.type(screen.getByLabelText(/prompt input/i), '生成一个组件');
+    await user.keyboard('{Enter}');
+
+    await waitFor(() => expect(screen.getByRole('group', { name: 'LiveWidget' })).toBeInTheDocument());
+    const iframe = getGeneratedIframe('LiveWidget');
+    dispatchSandboxMessage(iframe, {
+      type: 'COMPONENT_ERROR',
+      nodeId: 'generated-component-1',
+      message: 'Generated component did not return a React element',
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Generated component did not return a React element');
+    expect(screen.getByRole('group', { name: 'LiveWidget' })).toBeInTheDocument();
+    expect(document.querySelector('.generated-component-shell')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders generated component backgrounds in the host frame without rewriting sandbox code', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => sessionStartPayload,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => generatedBackgroundComponentPayload,
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByLabelText(/prompt input/i)).toBeInTheDocument());
+    await user.type(screen.getByLabelText(/prompt input/i), '给组件加背景');
+    await user.keyboard('{Enter}');
+
+    await waitFor(() => expect(screen.getByRole('group', { name: 'BackgroundWidget' })).toBeInTheDocument());
+    const frame = screen.getByRole('group', { name: 'BackgroundWidget' });
+    expect(frame).toHaveClass('generated-component-frame--background');
+    expect(frame).toHaveStyle({ backgroundSize: 'cover' });
+    expect(getGeneratedIframe('BackgroundWidget').srcdoc).not.toContain('__renderOriginalComponent');
+  });
+
+  it('mounts generated React components with hook-capable sandbox runtime', async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({
@@ -531,10 +742,16 @@ describe('App', () => {
     await user.keyboard('{Enter}');
 
     await waitFor(() => expect(screen.getByRole('group', { name: 'HookTimer' })).toBeInTheDocument());
-    expect(screen.getByText('Hook timer: 7')).toBeInTheDocument();
+    const iframe = getGeneratedIframe('HookTimer');
+    expect(iframe.srcdoc).toContain('useState');
+    expect(iframe.srcdoc).toContain('useEffect');
+    expect(iframe.srcdoc).toContain('useMemo');
+    expect(iframe.srcdoc).toContain('useCallback');
+    expect(iframe.srcdoc).toContain('"createElement",');
+    expect(iframe.srcdoc).toContain('"useRef",');
   });
 
-  it('keeps generated React component controls clickable on the canvas', async () => {
+  it('bridges declared generated component capabilities from the sandbox', async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({
@@ -543,7 +760,11 @@ describe('App', () => {
       })
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => generatedInteractiveComponentPayload,
+        json: async () => generatedComponentPayload,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => sessionMessagePayload,
       });
 
     vi.stubGlobal('fetch', fetchMock);
@@ -552,12 +773,26 @@ describe('App', () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByLabelText(/prompt input/i)).toBeInTheDocument());
-    await user.type(screen.getByLabelText(/prompt input/i), '生成一个可以点击的组件');
+    await user.type(screen.getByLabelText(/prompt input/i), '生成一个组件');
     await user.keyboard('{Enter}');
 
-    await waitFor(() => expect(screen.getByRole('group', { name: 'InteractiveWidget' })).toBeInTheDocument());
-    await user.click(screen.getByRole('button', { name: 'Clicked 0' }));
+    await waitFor(() => expect(screen.getByRole('group', { name: 'LiveWidget' })).toBeInTheDocument());
+    const iframe = getGeneratedIframe('LiveWidget');
+    dispatchSandboxMessage(iframe, {
+      type: 'CALL_CAPABILITY',
+      nodeId: 'generated-component-1',
+      capability: 'sendPrompt',
+      args: ['Build a portfolio page'],
+    });
 
-    expect(screen.getByRole('button', { name: 'Clicked 1' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        'http://localhost:8787/api/session/message',
+        expect.objectContaining({
+          body: JSON.stringify({ sessionId: 'session-1', prompt: 'Build a portfolio page' }),
+          method: 'POST',
+        }),
+      ),
+    );
   });
 });

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { PageNode, PagePatchOperation, PageState } from './types';
-import { pageNodeSchema, pagePatchOperationSchema } from './types';
+import { generatedComponentMetaSchema, pageNodeSchema, pagePatchOperationSchema } from './types';
 
 const systemComponentTypes = new Set(['system_prompt', 'system_timeline']);
 const hostCapabilities = ['sendPrompt', 'selectSnapshot', 'exportCanvasPng'] as const;
@@ -32,6 +32,52 @@ function normalizeComponentProps(node: PageNode): void {
   }
 
   node.children.forEach(normalizeComponentProps);
+}
+
+function cssKeyToCamelCase(key: string): string {
+  if (key.startsWith('--')) {
+    return key;
+  }
+  return key
+    .replace(/^-webkit-/, 'Webkit-')
+    .replace(/^-moz-/, 'Moz-')
+    .replace(/^-ms-/, 'ms-')
+    .replace(/^-o-/, 'O-')
+    .replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
+}
+
+function normalizeStyleTokens(styleTokens: unknown): PageNode['styleTokens'] {
+  if (!styleTokens || typeof styleTokens !== 'object' || Array.isArray(styleTokens)) {
+    return {};
+  }
+
+  const normalized: Record<string, unknown> = {};
+  for (const [rawKey, value] of Object.entries(styleTokens as Record<string, unknown>)) {
+    const key = cssKeyToCamelCase(rawKey);
+    if (key === 'borderRadius') {
+      normalized.radius = value;
+      normalized.borderRadius = value;
+      continue;
+    }
+    if (key === 'boxShadow') {
+      normalized.shadow = value;
+      normalized.boxShadow = value;
+      continue;
+    }
+    if (key === 'textAlign') {
+      normalized.align = value;
+      normalized.textAlign = value;
+      continue;
+    }
+    normalized[key] = value;
+  }
+
+  return normalized as PageNode['styleTokens'];
+}
+
+function normalizeNodeForValidation(node: PageNode): void {
+  node.styleTokens = normalizeStyleTokens(node.styleTokens);
+  node.children.forEach(normalizeNodeForValidation);
 }
 
 const systemLayoutSchema = z
@@ -130,6 +176,7 @@ const componentPropsSchemas: Record<string, z.ZodObject<Record<string, z.ZodType
     code: z.string().min(1).max(generatedCodeMaxLength),
     mountProps: z.record(z.unknown()).optional(),
     capabilities: z.array(z.enum(hostCapabilities)).max(hostCapabilities.length).default([]),
+    componentMeta: generatedComponentMetaSchema.optional(),
   }),
 };
 
@@ -139,6 +186,14 @@ for (const [key, schema] of Object.entries(componentPropsSchemas)) {
 
 export function validatePatchOperations(rawPatch: unknown): PagePatchOperation[] {
   const patch = z.array(pagePatchOperationSchema).parse(rawPatch);
+  for (const operation of patch) {
+    if (operation.type === 'add_node') {
+      normalizeNodeForValidation(operation.node);
+    }
+    if (operation.type === 'update_node' && operation.styleTokens) {
+      operation.styleTokens = normalizeStyleTokens(operation.styleTokens);
+    }
+  }
   assertPatchSafety(patch);
   return patch;
 }
@@ -200,6 +255,7 @@ function assertPatchSafety(patch: PagePatchOperation[]): void {
 
 function sanitizeNode(node: PageNode): PageNode {
   const nextNode = pageNodeSchema.parse(structuredClone(node)) as PageNode;
+  normalizeNodeForValidation(nextNode);
   assertValidComponentProps(nextNode);
   return nextNode;
 }
@@ -211,9 +267,10 @@ function insertChild(parent: PageNode, node: PageNode, index?: number): void {
 
 export function applyPatchOperations(state: PageState, patch: PagePatchOperation[]): PageState {
   const nextState = cloneState(state);
-  assertPatchSafety(patch);
+  const operations = validatePatchOperations(patch);
+  assertPatchSafety(operations);
 
-  for (const operation of patch) {
+  for (const operation of operations) {
     switch (operation.type) {
       case 'add_node': {
         const parent = findNode(nextState.root, operation.target.parentId);

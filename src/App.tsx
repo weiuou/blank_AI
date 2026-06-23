@@ -118,7 +118,7 @@ function findNodeByType(node: PageNode, type: PageNode['type']): PageNode | unde
 }
 
 function hasUserCanvasContent(pageState: PageState): boolean {
-  return pageState.root.children.some((node) => node.type !== 'system_prompt' && node.type !== 'system_timeline');
+  return pageState.root.children.some((node: PageNode) => node.type !== 'system_prompt' && node.type !== 'system_timeline');
 }
 
 function getPromptStageStyle(node?: PageNode): CSSProperties {
@@ -249,9 +249,6 @@ export default function App() {
 
   function handleGeneratedComponentError(message: string) {
     setError(message);
-    if (conversation.canUndo && !busy) {
-      void handleUndo();
-    }
   }
 
   async function handleSnapshotSelect(snapshotId: string) {
@@ -284,12 +281,20 @@ export default function App() {
   const promptLayout =
     promptNode?.props.layout && typeof promptNode.props.layout === 'object' ? (promptNode.props.layout as Record<string, unknown>) : {};
   const promptPosition = String(promptLayout.position ?? 'center');
+  const promptPositionClass = hasCanvasContent ? 'composer-stage--dock' : `composer-stage--${promptPosition}`;
   const promptPlaceholder = String(promptNode?.props.placeholder ?? 'Describe the page you want to create...');
   const activeSnapshot = conversation.snapshots.find((snapshot) => snapshot.id === conversation.activeSnapshotId);
   const activeTextResponse =
     activeSnapshot?.assistantText && !activeSnapshot.hasPageChange && dismissedTextSnapshotId !== activeSnapshot.id
       ? activeSnapshot.assistantText
       : null;
+  const canvasStyle = hasCanvasContent
+    ? ({
+        background: pageState.theme.pageBackground,
+        color: pageState.theme.textPrimary,
+        fontFamily: pageState.theme.fontFamily,
+      } as CSSProperties)
+    : undefined;
 
   function handleMainClick(event: MouseEvent<HTMLElement>) {
     if (!activeSnapshot || !activeTextResponse) {
@@ -304,21 +309,8 @@ export default function App() {
     setDismissedTextSnapshotId(activeSnapshot.id);
   }
 
-  return (
-    <main className={hasCanvasContent ? 'app-shell app-shell--canvas' : 'app-shell'} onClick={handleMainClick}>
-      {hasCanvasContent ? (
-        <div className="canvas-background">
-          <PageRenderer
-            activeSnapshotId={conversation.activeSnapshotId}
-            onExportCanvas={handleExportCanvas}
-            onGeneratedComponentError={handleGeneratedComponentError}
-            onSelectSnapshot={(snapshotId) => void handleSnapshotSelect(snapshotId)}
-            onSendPrompt={(prompt) => void handlePromptSubmit(prompt)}
-            pageState={pageState}
-            snapshots={conversation.snapshots}
-          />
-        </div>
-      ) : null}
+  const promptOverlay = (
+    <>
       <TimelineRail
         activeSnapshotId={conversation.activeSnapshotId}
         busy={busy}
@@ -336,7 +328,7 @@ export default function App() {
           className={[
             'composer-stage',
             hasCanvasContent ? 'composer-stage--canvas' : '',
-            `composer-stage--${promptPosition}`,
+            promptPositionClass,
           ]
             .filter(Boolean)
             .join(' ')}
@@ -366,6 +358,27 @@ export default function App() {
           </div>
         ) : null}
       </section>
+    </>
+  );
+
+  return (
+    <main className={hasCanvasContent ? 'app-shell app-shell--canvas' : 'app-shell'} onClick={handleMainClick}>
+      {hasCanvasContent ? (
+        <div className="canvas-background" style={canvasStyle}>
+          <PageRenderer
+            activeSnapshotId={conversation.activeSnapshotId}
+            onExportCanvas={handleExportCanvas}
+            onGeneratedComponentError={handleGeneratedComponentError}
+            onSelectSnapshot={(snapshotId) => void handleSnapshotSelect(snapshotId)}
+            onSendPrompt={(prompt) => void handlePromptSubmit(prompt)}
+            pageState={pageState}
+            snapshots={conversation.snapshots}
+          />
+          <div className="canvas-overlay-layer">{promptOverlay}</div>
+        </div>
+      ) : (
+        promptOverlay
+      )}
       {busy ? (
         <div className="generation-status" role="status" aria-live="polite">
           <span className="generation-status__ring" />

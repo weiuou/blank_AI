@@ -109,6 +109,23 @@ describe('applyPatchOperations', () => {
     expect(() => applyPatchOperations(initial, patch)).toThrow(/System/);
   });
 
+  it('rejects empty update_node operations', () => {
+    const initial = createInitialPageState();
+    const patch = [{ type: 'update_node', nodeId: 'system-prompt' }] as unknown as PagePatchOperation[];
+    const patchWithEmptyObjects = [
+      {
+        type: 'update_node',
+        nodeId: 'system-prompt',
+        props: {},
+        styleTokens: {},
+        behavior: {},
+      },
+    ] as unknown as PagePatchOperation[];
+
+    expect(() => applyPatchOperations(initial, patch)).toThrow(/update_node requires props, styleTokens, or behavior/);
+    expect(() => applyPatchOperations(initial, patchWithEmptyObjects)).toThrow(/update_node requires props, styleTokens, or behavior/);
+  });
+
   it('accepts sandboxed generated React components with declared capabilities', () => {
     const initial = createInitialPageState();
     const patch: PagePatchOperation[] = [
@@ -266,10 +283,47 @@ describe('applyPatchOperations', () => {
     expect(panel?.styleTokens).toMatchObject({
       gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
       backdropFilter: 'blur(18px) saturate(1.2)',
-      '-webkit-backdrop-filter': 'blur(18px) saturate(1.2)',
+      WebkitBackdropFilter: 'blur(18px) saturate(1.2)',
       '--accent-ink': '#1f5eff',
       zIndex: 999,
       opacity: 'var(--panel-opacity, 0.92)',
+    });
+  });
+
+  it('normalizes kebab-case CSS style tokens before applying patches', () => {
+    const initial = createInitialPageState();
+    const patch = [
+      {
+        type: 'add_node',
+        target: { parentId: 'root' },
+        node: {
+          id: 'kebab-panel',
+          type: 'card',
+          props: { title: 'Kebab CSS' },
+          styleTokens: {
+            'border-radius': '22px',
+            'box-shadow': '0 12px 40px rgba(0,0,0,0.1)',
+            'text-align': 'center',
+            'grid-template-columns': 'repeat(2, minmax(0, 1fr))',
+            '-webkit-backdrop-filter': 'blur(12px)',
+          },
+          children: [],
+        },
+      },
+    ] as unknown as PagePatchOperation[];
+
+    const next = applyPatchOperations(initial, patch);
+    const panel = next.root.children.find((node: PageNode) => node.id === 'kebab-panel');
+
+    expect(panel?.styleTokens).toMatchObject({
+      radius: '22px',
+      borderRadius: '22px',
+      shadow: '0 12px 40px rgba(0,0,0,0.1)',
+      boxShadow: '0 12px 40px rgba(0,0,0,0.1)',
+      align: 'center',
+      textAlign: 'center',
+      gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+      WebkitBackdropFilter: 'blur(12px)',
     });
   });
 

@@ -1,4 +1,4 @@
-import type { CSSProperties } from 'react';
+import { createElement, type CSSProperties, type ElementType } from 'react';
 import { GeneratedComponentFrame } from './GeneratedComponentFrame';
 import type { PageNode, PageState, SessionSnapshot } from '../shared/types';
 
@@ -32,10 +32,10 @@ function nodeStyleToCss(styleTokens: PageNode['styleTokens']): CSSProperties {
     css.borderRadius = styleTokens.radius;
   }
   if (styleTokens.shadow) {
-    css.boxShadow = styleTokens.shadow;
+    css.boxShadow = String(styleTokens.shadow);
   }
   if (styleTokens.align) {
-    css.textAlign = styleTokens.align;
+    css.textAlign = String(styleTokens.align) as CSSProperties['textAlign'];
   }
   return css;
 }
@@ -60,8 +60,8 @@ function RenderedNode({ context, node }: { context: RenderContext; node: PageNod
     case 'heading': {
       const level = Number(node.props.level ?? 2);
       const safeLevel = Math.min(4, Math.max(1, level));
-      const Tag = `h${safeLevel}` as keyof JSX.IntrinsicElements;
-      return <Tag style={style}>{String(node.props.text ?? '')}</Tag>;
+      const Tag = `h${safeLevel}` as ElementType;
+      return createElement(Tag, { style }, String(node.props.text ?? ''));
     }
     case 'text':
       return <p style={style}>{String(node.props.text ?? '')}</p>;
@@ -188,7 +188,6 @@ export function PageRenderer({
   snapshots,
 }: PageRendererProps) {
   const rootStyle: CSSProperties = {
-    background: pageState.theme.pageBackground,
     color: pageState.theme.textPrimary,
     fontFamily: pageState.theme.fontFamily,
     minHeight: '100vh',
@@ -196,7 +195,7 @@ export function PageRenderer({
 
   return (
     <div className="page-renderer" style={rootStyle}>
-      {pageState.root.children.map((child) => (
+      {pageState.root.children.map((child: PageNode) => (
         <RenderedNode
           context={{
             activeSnapshotId,
